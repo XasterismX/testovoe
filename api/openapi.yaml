@@ -1,0 +1,365 @@
+openapi: 3.0.3
+info:
+  title: Task Manager API
+  version: 1.0.0
+  description: |
+    REST API управления задачами внутри команд: роли (owner/admin/member), история изменений,
+    комментарии, кеш списка задач (Redis, TTL 5 минут) и SQL-отчёт по команде.
+    Аутентификация — JWT (`Authorization: Bearer <token>`), токен выдаёт `POST /login`.
+servers:
+  - url: http://localhost:8080
+tags:
+  - name: auth
+  - name: teams
+  - name: tasks
+  - name: stats
+security:
+  - bearerAuth: []
+paths:
+  /api/v1/register:
+    post:
+      tags: [auth]
+      summary: Регистрация пользователя
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RegisterRequest' }
+      responses:
+        '201': { description: Пользователь создан, content: { application/json: { schema: { $ref: '#/components/schemas/User' } } } }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /api/v1/login:
+    post:
+      tags: [auth]
+      summary: Аутентификация, выдача JWT
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LoginRequest' }
+      responses:
+        '200': { description: Токен, content: { application/json: { schema: { $ref: '#/components/schemas/LoginResponse' } } } }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /api/v1/teams:
+    post:
+      tags: [teams]
+      summary: Создать команду (текущий пользователь становится owner; операция атомарна)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateTeamRequest' }
+      responses:
+        '201': { description: Команда создана, content: { application/json: { schema: { $ref: '#/components/schemas/Team' } } } }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    get:
+      tags: [teams]
+      summary: Список команд текущего пользователя
+      responses:
+        '200': { description: Команды, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/Team' } } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /api/v1/teams/{id}/invite:
+    post:
+      tags: [teams]
+      summary: Добавить зарегистрированного пользователя в команду (owner/admin)
+      description: owner может выдавать роли admin и member, admin — только member. Роль owner выдать нельзя.
+      parameters: [ { $ref: '#/components/parameters/TeamId' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/InviteRequest' }
+      responses:
+        '201': { description: Участник добавлен, content: { application/json: { schema: { $ref: '#/components/schemas/Member' } } } }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /api/v1/teams/{id}/members/{user_id}/role:
+    put:
+      tags: [teams]
+      summary: Изменить роль участника (только owner; роль owner изменить нельзя)
+      parameters:
+        - { $ref: '#/components/parameters/TeamId' }
+        - { name: user_id, in: path, required: true, schema: { type: integer, format: int64 } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ChangeRoleRequest' }
+      responses:
+        '200': { description: Роль изменена, content: { application/json: { schema: { $ref: '#/components/schemas/Member' } } } }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/v1/teams/{team_id}/stats:
+    get:
+      tags: [stats]
+      summary: SQL-отчёт по команде (только owner/admin)
+      description: |
+        Один SQL-запрос (CTE + JOIN + GROUP BY + агрегаты + даты): задачи по статусам, топ-3 исполнителя
+        по закрытым задачам за 30 дней, среднее время закрытия, количество комментариев (всего и по задачам).
+      parameters:
+        - { name: team_id, in: path, required: true, schema: { type: integer, format: int64 } }
+      responses:
+        '200': { description: Статистика, content: { application/json: { schema: { $ref: '#/components/schemas/TeamStats' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /api/v1/tasks:
+    post:
+      tags: [tasks]
+      summary: Создать задачу в команде (любой участник); задача и история пишутся атомарно
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateTaskRequest' }
+      responses:
+        '201': { description: Задача создана, content: { application/json: { schema: { $ref: '#/components/schemas/Task' } } } }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    get:
+      tags: [tasks]
+      summary: Список задач команды (фильтры, пагинация, кеш Redis 5 минут)
+      parameters:
+        - { name: team_id, in: query, required: true, schema: { type: integer, format: int64 } }
+        - { name: status, in: query, schema: { $ref: '#/components/schemas/Status' } }
+        - { name: assignee_id, in: query, schema: { type: integer, format: int64 } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 20 } }
+        - { name: offset, in: query, schema: { type: integer, minimum: 0, default: 0 } }
+      responses:
+        '200': { description: Страница задач, content: { application/json: { schema: { $ref: '#/components/schemas/TaskList' } } } }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /api/v1/tasks/{id}:
+    put:
+      tags: [tasks]
+      summary: Обновить задачу с проверкой прав и записью истории
+      description: |
+        Права: owner/admin — любые задачи; создатель задачи — название, описание, статус, исполнитель;
+        исполнитель — только статус; остальные — нельзя. Передаются только изменяемые поля;
+        `assignee_id: null` снимает исполнителя. Необязательное `version` включает оптимистичную блокировку (409 при расхождении).
+        Конкурентные обновления сериализуются `SELECT ... FOR UPDATE`, история строится от актуального состояния.
+      parameters: [ { $ref: '#/components/parameters/TaskId' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateTaskRequest' }
+      responses:
+        '200': { description: Обновлённая задача, content: { application/json: { schema: { $ref: '#/components/schemas/Task' } } } }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /api/v1/tasks/{id}/history:
+    get:
+      tags: [tasks]
+      summary: История изменений задачи (участники команды)
+      parameters: [ { $ref: '#/components/parameters/TaskId' } ]
+      responses:
+        '200': { description: История, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/HistoryEntry' } } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/v1/tasks/{id}/comments:
+    post:
+      tags: [tasks]
+      summary: Добавить комментарий (участники команды)
+      parameters: [ { $ref: '#/components/parameters/TaskId' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateCommentRequest' }
+      responses:
+        '201': { description: Комментарий создан, content: { application/json: { schema: { $ref: '#/components/schemas/Comment' } } } }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    get:
+      tags: [tasks]
+      summary: Список комментариев задачи (участники команды)
+      parameters: [ { $ref: '#/components/parameters/TaskId' } ]
+      responses:
+        '200': { description: Комментарии, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/Comment' } } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+components:
+  securitySchemes:
+    bearerAuth: { type: http, scheme: bearer, bearerFormat: JWT }
+  parameters:
+    TeamId: { name: id, in: path, required: true, schema: { type: integer, format: int64 } }
+    TaskId: { name: id, in: path, required: true, schema: { type: integer, format: int64 } }
+  responses:
+    ValidationError: { description: Некорректный запрос (400), content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    Unauthorized: { description: Нет или неверный токен / учётные данные (401), content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    Forbidden: { description: Недостаточно прав или пользователь не участник команды (403), content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    NotFound: { description: Не найдено; для задач чужой команды тоже 404, чтобы не раскрывать их существование, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    Conflict: { description: Конфликт (дубликат или конкурентное изменение, 409), content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+  schemas:
+    Error:
+      type: object
+      properties:
+        error: { type: string, example: only the owner or an admin can view team stats }
+        code: { type: string, enum: [validation_error, unauthorized, forbidden, not_found, conflict, rate_limited, internal_error] }
+    Status: { type: string, enum: [todo, in_progress, done] }
+    Role: { type: string, enum: [owner, admin, member] }
+    RegisterRequest:
+      type: object
+      required: [email, name, password]
+      properties:
+        email: { type: string, format: email }
+        name: { type: string, maxLength: 255 }
+        password: { type: string, minLength: 8, maxLength: 72 }
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email: { type: string, format: email }
+        password: { type: string }
+    LoginResponse:
+      type: object
+      properties:
+        token: { type: string }
+        expires_at: { type: string, format: date-time }
+    User:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        email: { type: string }
+        name: { type: string }
+        created_at: { type: string, format: date-time }
+    CreateTeamRequest:
+      type: object
+      required: [name]
+      properties: { name: { type: string, maxLength: 255 } }
+    Team:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        name: { type: string }
+        created_by: { type: integer, format: int64 }
+        created_at: { type: string, format: date-time }
+        role: { $ref: '#/components/schemas/Role' }
+    InviteRequest:
+      type: object
+      required: [email]
+      properties:
+        email: { type: string, format: email }
+        role: { type: string, enum: [admin, member], default: member }
+    ChangeRoleRequest:
+      type: object
+      required: [role]
+      properties:
+        role: { type: string, enum: [admin, member] }
+    Member:
+      type: object
+      properties:
+        team_id: { type: integer, format: int64 }
+        user_id: { type: integer, format: int64 }
+        role: { $ref: '#/components/schemas/Role' }
+    CreateTaskRequest:
+      type: object
+      required: [team_id, title]
+      properties:
+        team_id: { type: integer, format: int64 }
+        title: { type: string, maxLength: 255 }
+        description: { type: string }
+        status: { $ref: '#/components/schemas/Status' }
+        assignee_id: { type: integer, format: int64, nullable: true }
+    UpdateTaskRequest:
+      type: object
+      properties:
+        title: { type: string, maxLength: 255 }
+        description: { type: string }
+        status: { $ref: '#/components/schemas/Status' }
+        assignee_id: { type: integer, format: int64, nullable: true, description: 'null снимает исполнителя' }
+        version: { type: integer, description: Ожидаемая версия задачи (оптимистичная блокировка) }
+    Task:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        team_id: { type: integer, format: int64 }
+        title: { type: string }
+        description: { type: string }
+        status: { $ref: '#/components/schemas/Status' }
+        created_by: { type: integer, format: int64 }
+        assignee_id: { type: integer, format: int64, nullable: true }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        closed_at: { type: string, format: date-time, nullable: true }
+        version: { type: integer }
+    TaskList:
+      type: object
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/Task' } }
+        total: { type: integer }
+        limit: { type: integer }
+        offset: { type: integer }
+    HistoryEntry:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        task_id: { type: integer, format: int64 }
+        changed_by: { type: integer, format: int64 }
+        created_at: { type: string, format: date-time }
+        changes:
+          type: object
+          description: 'Поле → {old, new}'
+          additionalProperties:
+            type: object
+            properties:
+              old: { nullable: true }
+              new: { nullable: true }
+          example:
+            status: { old: todo, new: done }
+    CreateCommentRequest:
+      type: object
+      required: [content]
+      properties: { content: { type: string, maxLength: 5000 } }
+    Comment:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        task_id: { type: integer, format: int64 }
+        user_id: { type: integer, format: int64 }
+        content: { type: string }
+        created_at: { type: string, format: date-time }
+    TeamStats:
+      type: object
+      properties:
+        team_id: { type: integer, format: int64 }
+        tasks_by_status:
+          type: object
+          additionalProperties: { type: integer }
+          example: { todo: 3, in_progress: 1, done: 8 }
+        top_assignees_30d:
+          type: array
+          items:
+            type: object
+            properties:
+              user_id: { type: integer, format: int64 }
+              name: { type: string }
+              closed_tasks: { type: integer }
+        closed_tasks: { type: integer }
+        avg_close_time_seconds: { type: number, nullable: true }
+        comments_total: { type: integer }
+        comments_by_task:
+          type: array
+          description: Топ-10 задач по числу комментариев
+          items:
+            type: object
+            properties:
+              task_id: { type: integer, format: int64 }
+              title: { type: string }
+              comments: { type: integer }
